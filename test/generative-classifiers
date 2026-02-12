@@ -157,7 +157,7 @@ def run_classifier(condition, example)
   return nil if fields.empty?
 
   prompt = CLASSIFIER_TEMPLATE % { condition: condition, fields: fields }
-  stdout, status = Open3.capture2('ollama', 'run', CLASSIFIER_MODEL, stdin_data: prompt)
+  stdout, status = Open3.capture2('ollama', 'run', CLASSIFIER_MODEL, stdin_data: prompt, err: File::NULL)
   return nil unless status.success?
 
   stdout.strip.downcase.start_with?('yes') ? 'yes' : 'no'
@@ -170,7 +170,8 @@ rescue => e
 end
 
 def classify_with_majority(condition, example, trials: 3)
-  results = trials.times.map { run_classifier(condition, example) }.compact
+  threads = trials.times.map { Thread.new { run_classifier(condition, example) } }
+  results = threads.map(&:value).compact
   return nil if results.empty?
 
   yes_count = results.count('yes')
@@ -306,8 +307,30 @@ def run
     return
   end
 
-  all_failures = {}
+  # Build work items: [condition, polarity, index, example, expected]
+  work = []
+  conditions.each do |condition|
+    fixture = fixtures[condition]
+    next unless fixture
+    (fixture['positive'] || []).each_with_index do |example, i|
+      work << { condition: condition, polarity: 'positive', index: i, example: example, expected: 'yes' }
+    end
+    (fixture['negative'] || []).each_with_index do |example, i|
+      work << { condition: condition, polarity: 'negative', index: i, example: example, expected: 'no' }
+    end
+  end
 
+  # Run all fixtures in parallel
+  threads = work.map do |item|
+    Thread.new(item) do |w|
+      result = classify_with_majority(w[:condition], w[:example])
+      w[:result] = result
+    end
+  end
+  threads.each(&:join)
+
+  # Report results in order
+  all_failures = {}
   conditions.each do |condition|
     fixture = fixtures[condition]
     unless fixture
@@ -316,31 +339,18 @@ def run
     end
 
     failures = []
-
-    (fixture['positive'] || []).each_with_index do |example, i|
-      result = classify_with_majority(condition, example)
-      if result.nil?
-        skip_test("\"#{condition}\" positive[#{i}]", 'ollama failed')
-      elsif result == 'yes'
-        pass("\"#{condition}\" positive[#{i}]")
+    items = work.select { |w| w[:condition] == condition }
+    items.each do |w|
+      label = "\"#{w[:condition]}\" #{w[:polarity]}[#{w[:index]}]"
+      if w[:result].nil?
+        skip_test(label, 'ollama failed')
+      elsif w[:result] == w[:expected]
+        pass(label)
       else
-        fail("\"#{condition}\" positive[#{i}]", 'expected yes, got no')
-        failures << { expected: 'yes', example: example }
+        fail(label, "expected #{w[:expected]}, got #{w[:result]}")
+        failures << { expected: w[:expected], example: w[:example] }
       end
     end
-
-    (fixture['negative'] || []).each_with_index do |example, i|
-      result = classify_with_majority(condition, example)
-      if result.nil?
-        skip_test("\"#{condition}\" negative[#{i}]", 'ollama failed')
-      elsif result == 'no'
-        pass("\"#{condition}\" negative[#{i}]")
-      else
-        fail("\"#{condition}\" negative[#{i}]", 'expected no, got yes')
-        failures << { expected: 'no', example: example }
-      end
-    end
-
     all_failures[condition] = failures unless failures.empty?
   end
 

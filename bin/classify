@@ -14,21 +14,27 @@ require_relative '../lib/classifier'
 require 'json'
 require 'open3'
 
+SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
+if File.directory?(SPILL_HOME)
+  require File.join(SPILL_HOME, 'lib', 'spill')
+  Spill.configure(tool: 'classify')
+end
+
 input = JSON.parse($stdin.read)
 condition = input.delete('condition')
 model = input.delete('model') || CLASSIFIER_MODEL
 
 fields = build_classifier_input(input)
 if fields.empty?
-  $stderr.puts "classify: no input fields provided"
+  defined?(Spill) ? Spill.error("no input fields provided") : $stderr.puts("classify: no input fields provided")
   exit 1
 end
 
 prompt = CLASSIFIER_TEMPLATE % { condition: condition, fields: fields }
-stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt)
+stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt, err: File::NULL)
 
 unless status.success?
-  $stderr.puts "classify: ollama exited with #{status.exitstatus}"
+  defined?(Spill) ? Spill.error("ollama exited with #{status.exitstatus}") : $stderr.puts("classify: ollama exited with #{status.exitstatus}")
   exit 1
 end
 
