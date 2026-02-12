@@ -4,7 +4,7 @@
 # Shared between bin/classify and test/generative-classifiers.
 # Change the template here to update both production and tests.
 #
-# Used by: prophet/bin/lay (require), hooker/bin/hooker (via bin/classify subprocess)
+# Consumers require this file directly or call bin/classify as a subprocess.
 
 CLASSIFIER_TEMPLATE = "Does the following condition apply to this input? " \
                       "Answer \"yes\" or \"no\" only.\n\n" \

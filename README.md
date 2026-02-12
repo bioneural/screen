@@ -27,9 +27,9 @@ Does the following condition apply to this input? Answer "yes" or "no" only.
 
 Two integration paths:
 
-**As a library** — `prophet/bin/lay` requires `lib/classifier.rb` directly. It uses `CLASSIFIER_TEMPLATE`, `CLASSIFIER_MODEL`, and `build_classifier_input` to construct prompts, then calls ollama itself.
+**As a library** — require `lib/classifier.rb` directly. Use `CLASSIFIER_TEMPLATE`, `CLASSIFIER_MODEL`, and `build_classifier_input` to construct prompts, then call ollama yourself.
 
-**As a subprocess** — `hooker/bin/hooker` calls `bin/classify` via `Open3.capture2`. It sends JSON on stdin, receives "yes" or "no" on stdout. hooker stays stdlib-only — no require path into screen.
+**As a subprocess** — call `bin/classify` via stdin/stdout. Send JSON, receive "yes" or "no". No require path needed — stays stdlib-only.
 
 ```sh
 echo '{"condition":"the file contains source code","file_path":"lib/foo.rb","content":"class Foo; end"}' | bin/classify
@@ -47,11 +47,12 @@ test/fixtures/classifiers.yml persisted test cases (auto-generated)
 
 ## Generative tests
 
-`test/generative-classifiers` discovers every `classifier:` field in frontmatter across prophet and its dependency repos. For each condition, it generates test fixtures via `claude -p` (5 positive, 5 negative), runs them against the production model with majority-wins voting (3 trials per case), and reports pass/fail. Orphaned fixtures are pruned. Failing conditions are offered for auto-rewrite.
+`test/generative-classifiers` accepts directories as arguments, globs `context/**/*.md` in each for `classifier:` frontmatter, generates test fixtures via `claude -p` (5 positive, 5 negative), runs them against the production model with majority-wins voting (3 trials per case), and reports pass/fail. Orphaned fixtures are pruned. Failing conditions are offered for auto-rewrite. With no arguments, runs existing fixtures only.
 
 ```sh
-test/generative-classifiers              # full cycle
-test/generative-classifiers --generate   # force regenerate all fixtures
+test/generative-classifiers /path/to/repo1 /path/to/repo2   # discover + run
+test/generative-classifiers --generate /path/to/repo1        # force regenerate
+test/generative-classifiers                                  # run existing fixtures only
 ```
 
 ## Requirements

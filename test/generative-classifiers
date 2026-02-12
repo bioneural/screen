@@ -2,21 +2,24 @@
 # test/generative-classifiers — self-maintaining generative test for classifier prompts
 # MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
-# Discovers classifier conditions from frontmatter across prophet + DEPS repos.
+# Discovers classifier conditions from frontmatter across given directories.
 # Generates test fixtures via claude -p, runs them against the production model
 # (ollama + CLASSIFIER_TEMPLATE), and reports pass/fail.
 #
 # Usage:
-#   test/generative-classifiers              # full cycle
-#   test/generative-classifiers --generate   # force regenerate all fixtures
+#   test/generative-classifiers /path/to/repo1 /path/to/repo2   # discover + run
+#   test/generative-classifiers --generate /path/to/repo1        # force regenerate
+#   test/generative-classifiers                                  # run existing fixtures only
 #
 # Behavior:
-#   1. Discover classifiers from context/**/*.md frontmatter across repos
+#   1. Discover classifiers from context/**/*.md frontmatter across given dirs
 #   2. Load persisted test fixtures from test/fixtures/classifiers.yml
 #   3. Diff: new classifiers → generate fixtures; orphaned → delete
 #   4. Run all fixtures against production model (3 trials, majority wins)
 #   5. Report pass/fail
 #   6. For consistently failing classifiers → offer rewrite via claude -p
+#
+# If no directories are given, skips discovery and runs existing fixtures.
 #
 # Dependencies: ruby stdlib, ollama, claude CLI (for generation/rewrite only)
 
@@ -28,27 +31,10 @@ require 'fileutils'
 
 SCREEN_ROOT = File.expand_path('..', __dir__)
 FIXTURES_PATH = File.join(SCREEN_ROOT, 'test', 'fixtures', 'classifiers.yml')
-PROPHET_ROOT = File.expand_path('../../prophet', SCREEN_ROOT)
-FORCE_GENERATE = ARGV.include?('--generate')
+FORCE_GENERATE = ARGV.delete('--generate')
+SEARCH_DIRS = ARGV.map { |d| File.expand_path(d) }.select { |d| File.directory?(d) }
 
-# -- Prophet dependency resolution --
-
-def load_deps
-  deps_path = File.join(PROPHET_ROOT, 'os', 'deps.rb')
-  return {} unless File.exist?(deps_path)
-
-  # Evaluate deps.rb in isolation to get DEPS hash
-  deps_content = File.read(deps_path)
-  # Extract the hash manually — deps.rb defines DEPS as a simple hash
-  binding_context = binding
-  eval(deps_content, binding_context, deps_path)
-  binding_context.eval('DEPS')
-rescue => e
-  $stderr.puts "generative-classifiers: failed to load deps: #{e.message}"
-  {}
-end
-
-# -- Frontmatter parsing (minimal, same as lay) --
+# -- Frontmatter parsing (minimal YAML subset) --
 
 def parse_frontmatter(path)
   lines = []
@@ -93,11 +79,8 @@ end
 def discover_classifiers
   classifiers = {}
 
-  search_paths = [[PROPHET_ROOT, 'prophet']]
-  deps = load_deps
-  deps.each { |name, dir| search_paths << [dir, name.to_s] }
-
-  search_paths.each do |dir, repo|
+  SEARCH_DIRS.each do |dir|
+    repo = File.basename(dir)
     Dir.glob(File.join(dir, 'context', '**', '*.md')).each do |path|
       meta = parse_frontmatter(path)
       next unless meta && meta['classifier']
@@ -252,50 +235,62 @@ def run
   puts "generative classifier tests"
   puts '=' * 40
 
-  # 1. Discover
+  # 1. Discover (only if search dirs provided)
   printf "\n\033[1mDiscovery\033[0m\n"
-  classifiers = discover_classifiers
-  if classifiers.empty?
-    puts "  No classifiers found."
-    exit 0
-  end
-  classifiers.each do |condition, info|
-    puts "  #{info['repo']}: \"#{condition}\""
+  if SEARCH_DIRS.empty?
+    puts "  No search directories given — running existing fixtures only."
+    classifiers = {}
+  else
+    classifiers = discover_classifiers
+    if classifiers.empty?
+      puts "  No classifiers found in: #{SEARCH_DIRS.join(', ')}"
+    else
+      classifiers.each do |condition, info|
+        puts "  #{info['repo']}: \"#{condition}\""
+      end
+    end
   end
 
   # 2. Load fixtures
   fixtures = load_fixtures
 
-  # 3. Diff — generate missing, prune orphaned
+  # 3. Diff — generate missing, prune orphaned (only when discovering)
   printf "\n\033[1mFixtures\033[0m\n"
   changed = false
 
-  # Remove orphaned
-  orphaned = fixtures.keys - classifiers.keys
-  orphaned.each do |condition|
-    puts "  removing orphaned fixture: \"#{condition}\""
-    fixtures.delete(condition)
-    changed = true
-  end
-
-  # Generate missing
-  missing = classifiers.keys - fixtures.keys
-  missing.concat(classifiers.keys) if FORCE_GENERATE
-
-  if missing.empty? && !changed
-    puts "  All fixtures up to date."
-  end
-
-  missing.uniq.each do |condition|
-    puts "  generating fixtures for: \"#{condition}\""
-    generated = generate_fixtures(condition)
-    if generated
-      fixtures[condition] = generated
+  unless classifiers.empty?
+    # Remove orphaned
+    orphaned = fixtures.keys - classifiers.keys
+    orphaned.each do |condition|
+      puts "  removing orphaned fixture: \"#{condition}\""
+      fixtures.delete(condition)
       changed = true
-      puts "    #{generated['positive'].length} positive, #{generated['negative'].length} negative"
-    else
-      puts "    FAILED — skipping"
     end
+
+    # Generate missing
+    missing = classifiers.keys - fixtures.keys
+    missing.concat(classifiers.keys) if FORCE_GENERATE
+
+    missing.uniq.each do |condition|
+      puts "  generating fixtures for: \"#{condition}\""
+      generated = generate_fixtures(condition)
+      if generated
+        fixtures[condition] = generated
+        changed = true
+        puts "    #{generated['positive'].length} positive, #{generated['negative'].length} negative"
+      else
+        puts "    FAILED — skipping"
+      end
+    end
+  end
+
+  if fixtures.empty?
+    puts "  No fixtures found."
+    exit 0
+  end
+
+  if !changed
+    puts "  All fixtures up to date (#{fixtures.size} conditions)."
   end
 
   save_fixtures(fixtures) if changed
@@ -304,15 +299,16 @@ def run
   printf "\n\033[1mClassifier tests\033[0m\n"
 
   # Check ollama available
+  conditions = classifiers.empty? ? fixtures.keys : classifiers.keys
   unless system('which ollama > /dev/null 2>&1')
-    classifiers.each_key { |c| skip_test(c, 'ollama not found') }
+    conditions.each { |c| skip_test(c, 'ollama not found') }
     print_summary
     return
   end
 
   all_failures = {}
 
-  classifiers.each_key do |condition|
+  conditions.each do |condition|
     fixture = fixtures[condition]
     unless fixture
       skip_test("\"#{condition}\"", 'no fixtures')
