@@ -1,4 +1,5 @@
 # lib/classifier.rb — classifier prompt template and model configuration
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # Shared between bin/classify and test/generative-classifiers.
 # Change the template here to update both production and tests.

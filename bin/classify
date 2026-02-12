@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 # bin/classify — classify input against a condition via LLM
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # Reads JSON from stdin:
 #   { "condition": "...", "model": "gemma3:1b",

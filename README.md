@@ -1,37 +1,18 @@
-# screen
+<h1 align="center">
+  s c r e e n
+  <br>
+  <sub>shared classifier engine for condition evaluation</sub>
+</h1>
 
-Classifier engine for the prophet system. A single shared implementation for LLM-based condition evaluation — one template, one test target.
+A prompt is load-bearing. Change the format — colon-delimited fields to XML, "You are a classifier..." to "Does the following condition apply?" — and a 1B model flips from correct to wrong. screen eliminates the surface area. One template. One input builder. One test target. Every consumer inherits the same prompt that was tested, not a local copy that drifted.
 
-## Structure
+Ruby stdlib only. ollama for inference. No gems.
 
-```
-bin/classify                  standalone classifier (stdin JSON → stdout yes/no)
-lib/classifier.rb             prompt template + model config + input builder
-test/generative-classifiers   self-maintaining generative test harness
-test/fixtures/classifiers.yml persisted test cases
-```
+---
 
-## Usage
+## How it works
 
-### As a subprocess (hooker)
-
-```sh
-echo '{"condition":"the file contains source code","file_path":"lib/foo.rb","content":"class Foo; end"}' | bin/classify
-# → yes
-```
-
-### As a library (lay)
-
-```ruby
-require '/path/to/screen/lib/classifier'
-
-fields = build_classifier_input({ 'file_path' => 'lib/foo.rb', 'content' => 'class Foo; end' })
-prompt = CLASSIFIER_TEMPLATE % { condition: 'the file contains source code', fields: fields }
-```
-
-## Prompt format
-
-All classifier prompts use XML-only structure:
+screen evaluates plain-language conditions against structured input via a local LLM. The condition and input fields are wrapped in XML tags — no colon-delimited boundaries, no prose preamble. The model answers yes or no.
 
 ```
 Does the following condition apply to this input? Answer "yes" or "no" only.
@@ -44,8 +25,43 @@ Does the following condition apply to this input? Answer "yes" or "no" only.
 </input>
 ```
 
-## Dependencies
+Two integration paths:
 
-- Ruby stdlib
-- ollama (gemma3:1b default model)
-- claude CLI (for generative test fixture generation only)
+**As a library** — `prophet/bin/lay` requires `lib/classifier.rb` directly. It uses `CLASSIFIER_TEMPLATE`, `CLASSIFIER_MODEL`, and `build_classifier_input` to construct prompts, then calls ollama itself.
+
+**As a subprocess** — `hooker/bin/hooker` calls `bin/classify` via `Open3.capture2`. It sends JSON on stdin, receives "yes" or "no" on stdout. hooker stays stdlib-only — no require path into screen.
+
+```sh
+echo '{"condition":"the file contains source code","file_path":"lib/foo.rb","content":"class Foo; end"}' | bin/classify
+# → yes
+```
+
+## Structure
+
+```
+bin/classify                  stdin JSON → stdout yes/no
+lib/classifier.rb             CLASSIFIER_TEMPLATE + CLASSIFIER_MODEL + build_classifier_input
+test/generative-classifiers   discover classifiers, generate fixtures, run, report
+test/fixtures/classifiers.yml persisted test cases (auto-generated)
+```
+
+## Generative tests
+
+`test/generative-classifiers` discovers every `classifier:` field in frontmatter across prophet and its dependency repos. For each condition, it generates test fixtures via `claude -p` (5 positive, 5 negative), runs them against the production model with majority-wins voting (3 trials per case), and reports pass/fail. Orphaned fixtures are pruned. Failing conditions are offered for auto-rewrite.
+
+```sh
+test/generative-classifiers              # full cycle
+test/generative-classifiers --generate   # force regenerate all fixtures
+```
+
+## Requirements
+
+- Ruby (stdlib only)
+- ollama with `gemma3:1b` (or model specified in condition)
+- claude CLI (for fixture generation and auto-rewrite only)
+
+---
+
+## License
+
+MIT — Kerry Ivan Kurian

@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 # test/generative-classifiers — self-maintaining generative test for classifier prompts
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # Discovers classifier conditions from frontmatter across prophet + DEPS repos.
 # Generates test fixtures via claude -p, runs them against the production model
