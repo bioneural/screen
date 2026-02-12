@@ -65,4 +65,4 @@ test/generative-classifiers                                  # run existing fixt
 
 ## License
 
-MIT — Kerry Ivan Kurian
+MIT
