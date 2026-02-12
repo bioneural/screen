@@ -1,0 +1,392 @@
+#!/usr/bin/env ruby
+# test/generative-classifiers — self-maintaining generative test for classifier prompts
+#
+# Discovers classifier conditions from frontmatter across prophet + DEPS repos.
+# Generates test fixtures via claude -p, runs them against the production model
+# (ollama + CLASSIFIER_TEMPLATE), and reports pass/fail.
+#
+# Usage:
+#   test/generative-classifiers              # full cycle
+#   test/generative-classifiers --generate   # force regenerate all fixtures
+#
+# Behavior:
+#   1. Discover classifiers from context/**/*.md frontmatter across repos
+#   2. Load persisted test fixtures from test/fixtures/classifiers.yml
+#   3. Diff: new classifiers → generate fixtures; orphaned → delete
+#   4. Run all fixtures against production model (3 trials, majority wins)
+#   5. Report pass/fail
+#   6. For consistently failing classifiers → offer rewrite via claude -p
+#
+# Dependencies: ruby stdlib, ollama, claude CLI (for generation/rewrite only)
+
+require_relative '../lib/classifier'
+require 'json'
+require 'open3'
+require 'yaml'
+require 'fileutils'
+
+SCREEN_ROOT = File.expand_path('..', __dir__)
+FIXTURES_PATH = File.join(SCREEN_ROOT, 'test', 'fixtures', 'classifiers.yml')
+PROPHET_ROOT = File.expand_path('../../prophet', SCREEN_ROOT)
+FORCE_GENERATE = ARGV.include?('--generate')
+
+# -- Prophet dependency resolution --
+
+def load_deps
+  deps_path = File.join(PROPHET_ROOT, 'os', 'deps.rb')
+  return {} unless File.exist?(deps_path)
+
+  # Evaluate deps.rb in isolation to get DEPS hash
+  deps_content = File.read(deps_path)
+  # Extract the hash manually — deps.rb defines DEPS as a simple hash
+  binding_context = binding
+  eval(deps_content, binding_context, deps_path)
+  binding_context.eval('DEPS')
+rescue => e
+  $stderr.puts "generative-classifiers: failed to load deps: #{e.message}"
+  {}
+end
+
+# -- Frontmatter parsing (minimal, same as lay) --
+
+def parse_frontmatter(path)
+  lines = []
+  in_frontmatter = false
+  File.foreach(path).with_index do |line, i|
+    break if i > 20
+    stripped = line.strip
+    if stripped == '---'
+      if in_frontmatter
+        break
+      else
+        in_frontmatter = true
+        next
+      end
+    end
+    lines << line if in_frontmatter
+  end
+  return nil if lines.empty?
+
+  meta = {}
+  lines.each do |line|
+    if line =~ /\A(\w+):\s*\[([^\]]*)\]\s*\z/
+      key = $1
+      values = $2.split(',').map { |v| v.strip.delete('"').delete("'") }
+      meta[key] = values
+    elsif line =~ /\A(\w+):\s*"([^"]*)"\s*\z/
+      meta[$1] = $2.gsub('\\\\', '\\')
+    elsif line =~ /\A(\w+):\s*(true|false)\s*\z/
+      meta[$1] = $2 == 'true'
+    elsif line =~ /\A(\w+):\s*(.+)\s*\z/
+      meta[$1] = $2.strip
+    end
+  end
+  meta.empty? ? nil : meta
+rescue => e
+  $stderr.puts "generative-classifiers: error reading #{path}: #{e.message}"
+  nil
+end
+
+# -- Discovery --
+
+def discover_classifiers
+  classifiers = {}
+
+  search_paths = [[PROPHET_ROOT, 'prophet']]
+  deps = load_deps
+  deps.each { |name, dir| search_paths << [dir, name.to_s] }
+
+  search_paths.each do |dir, repo|
+    Dir.glob(File.join(dir, 'context', '**', '*.md')).each do |path|
+      meta = parse_frontmatter(path)
+      next unless meta && meta['classifier']
+      classifiers[meta['classifier']] = {
+        'repo' => repo,
+        'file' => path,
+      }
+    end
+  end
+
+  classifiers
+end
+
+# -- Fixture management --
+
+def load_fixtures
+  return {} unless File.exist?(FIXTURES_PATH)
+  data = YAML.safe_load(File.read(FIXTURES_PATH)) || {}
+  data
+rescue => e
+  $stderr.puts "generative-classifiers: error loading fixtures: #{e.message}"
+  {}
+end
+
+def save_fixtures(fixtures)
+  FileUtils.mkdir_p(File.dirname(FIXTURES_PATH))
+  File.write(FIXTURES_PATH, YAML.dump(fixtures))
+end
+
+# -- Generation via claude -p --
+
+def generate_fixtures(condition)
+  prompt = <<~PROMPT
+    Generate test cases for this classifier condition: "#{condition}"
+
+    The classifier receives event fields wrapped in XML tags:
+    <file_path>, <command>, <prompt>, <content>.
+    It answers yes/no based on whether the condition applies.
+
+    Output valid YAML — a hash with two keys:
+      positive: 5 examples that clearly match the condition
+      negative: 5 examples that clearly do NOT match
+
+    Each example is a hash with the relevant fields (file_path + content for file
+    classifiers, prompt for prompt classifiers, command for command classifiers).
+    Keep examples short and unambiguous. Output ONLY the YAML, no markdown fencing.
+  PROMPT
+
+  stdout, status = Open3.capture2('claude', '-p', stdin_data: prompt)
+  unless status.success?
+    $stderr.puts "generative-classifiers: claude -p failed for '#{condition}'"
+    return nil
+  end
+
+  # Strip any markdown fencing claude might add despite instructions
+  yaml_text = stdout.strip.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
+  parsed = YAML.safe_load(yaml_text)
+
+  unless parsed.is_a?(Hash) && parsed['positive'].is_a?(Array) && parsed['negative'].is_a?(Array)
+    $stderr.puts "generative-classifiers: invalid YAML from claude for '#{condition}'"
+    return nil
+  end
+
+  parsed
+rescue => e
+  $stderr.puts "generative-classifiers: generation failed for '#{condition}': #{e.message}"
+  nil
+end
+
+# -- Run classifier against fixture --
+
+def run_classifier(condition, example)
+  fields = build_classifier_input(example)
+  return nil if fields.empty?
+
+  prompt = CLASSIFIER_TEMPLATE % { condition: condition, fields: fields }
+  stdout, status = Open3.capture2('ollama', 'run', CLASSIFIER_MODEL, stdin_data: prompt)
+  return nil unless status.success?
+
+  stdout.strip.downcase.start_with?('yes') ? 'yes' : 'no'
+rescue Errno::ENOENT
+  $stderr.puts "generative-classifiers: ollama not found"
+  nil
+rescue => e
+  $stderr.puts "generative-classifiers: ollama failed: #{e.message}"
+  nil
+end
+
+def classify_with_majority(condition, example, trials: 3)
+  results = trials.times.map { run_classifier(condition, example) }.compact
+  return nil if results.empty?
+
+  yes_count = results.count('yes')
+  no_count = results.count('no')
+  yes_count >= no_count ? 'yes' : 'no'
+end
+
+# -- Auto-fix --
+
+def rewrite_condition(condition, failures)
+  failure_text = failures.map { |f|
+    expected = f[:expected]
+    example = f[:example].map { |k, v| "  #{k}: #{v}" }.join("\n")
+    "Expected #{expected}, got #{expected == 'yes' ? 'no' : 'yes'}:\n#{example}"
+  }.join("\n\n")
+
+  prompt = <<~PROMPT
+    This classifier condition failed on these inputs:
+
+    Condition: "#{condition}"
+    Failures:
+    #{failure_text}
+
+    Rewrite the condition so it correctly classifies these inputs.
+    Output only the new condition text, nothing else.
+  PROMPT
+
+  stdout, status = Open3.capture2('claude', '-p', stdin_data: prompt)
+  return nil unless status.success?
+
+  result = stdout.strip.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
+  result.delete('"')
+rescue => e
+  $stderr.puts "generative-classifiers: rewrite failed: #{e.message}"
+  nil
+end
+
+# -- Output --
+
+$pass = 0
+$fail = 0
+$skip = 0
+
+def pass(label)
+  $pass += 1
+  printf "  \033[32m✓\033[0m %s\n", label
+end
+
+def fail(label, detail = nil)
+  $fail += 1
+  printf "  \033[31m✗\033[0m %s%s\n", label, detail ? " — #{detail}" : ''
+end
+
+def skip_test(label, reason)
+  $skip += 1
+  printf "  \033[33m○\033[0m %s (skipped: %s)\n", label, reason
+end
+
+# -- Main --
+
+def run
+  puts "generative classifier tests"
+  puts '=' * 40
+
+  # 1. Discover
+  printf "\n\033[1mDiscovery\033[0m\n"
+  classifiers = discover_classifiers
+  if classifiers.empty?
+    puts "  No classifiers found."
+    exit 0
+  end
+  classifiers.each do |condition, info|
+    puts "  #{info['repo']}: \"#{condition}\""
+  end
+
+  # 2. Load fixtures
+  fixtures = load_fixtures
+
+  # 3. Diff — generate missing, prune orphaned
+  printf "\n\033[1mFixtures\033[0m\n"
+  changed = false
+
+  # Remove orphaned
+  orphaned = fixtures.keys - classifiers.keys
+  orphaned.each do |condition|
+    puts "  removing orphaned fixture: \"#{condition}\""
+    fixtures.delete(condition)
+    changed = true
+  end
+
+  # Generate missing
+  missing = classifiers.keys - fixtures.keys
+  missing.concat(classifiers.keys) if FORCE_GENERATE
+
+  if missing.empty? && !changed
+    puts "  All fixtures up to date."
+  end
+
+  missing.uniq.each do |condition|
+    puts "  generating fixtures for: \"#{condition}\""
+    generated = generate_fixtures(condition)
+    if generated
+      fixtures[condition] = generated
+      changed = true
+      puts "    #{generated['positive'].length} positive, #{generated['negative'].length} negative"
+    else
+      puts "    FAILED — skipping"
+    end
+  end
+
+  save_fixtures(fixtures) if changed
+
+  # 4. Run
+  printf "\n\033[1mClassifier tests\033[0m\n"
+
+  # Check ollama available
+  unless system('which ollama > /dev/null 2>&1')
+    classifiers.each_key { |c| skip_test(c, 'ollama not found') }
+    print_summary
+    return
+  end
+
+  all_failures = {}
+
+  classifiers.each_key do |condition|
+    fixture = fixtures[condition]
+    unless fixture
+      skip_test("\"#{condition}\"", 'no fixtures')
+      next
+    end
+
+    failures = []
+
+    (fixture['positive'] || []).each_with_index do |example, i|
+      result = classify_with_majority(condition, example)
+      if result.nil?
+        skip_test("\"#{condition}\" positive[#{i}]", 'ollama failed')
+      elsif result == 'yes'
+        pass("\"#{condition}\" positive[#{i}]")
+      else
+        fail("\"#{condition}\" positive[#{i}]", 'expected yes, got no')
+        failures << { expected: 'yes', example: example }
+      end
+    end
+
+    (fixture['negative'] || []).each_with_index do |example, i|
+      result = classify_with_majority(condition, example)
+      if result.nil?
+        skip_test("\"#{condition}\" negative[#{i}]", 'ollama failed')
+      elsif result == 'no'
+        pass("\"#{condition}\" negative[#{i}]")
+      else
+        fail("\"#{condition}\" negative[#{i}]", 'expected no, got yes')
+        failures << { expected: 'no', example: example }
+      end
+    end
+
+    all_failures[condition] = failures unless failures.empty?
+  end
+
+  # 5. Offer rewrite for consistently failing conditions
+  unless all_failures.empty?
+    printf "\n\033[1mAuto-fix\033[0m\n"
+    all_failures.each do |condition, failures|
+      puts "  \"#{condition}\" has #{failures.length} failures"
+      print "  Attempt rewrite? [y/N] "
+      answer = $stdin.gets&.strip
+      next unless answer&.downcase == 'y'
+
+      new_condition = rewrite_condition(condition, failures)
+      if new_condition && new_condition != condition
+        puts "  Proposed: \"#{new_condition}\""
+        print "  Accept and update frontmatter? [y/N] "
+        accept = $stdin.gets&.strip
+        if accept&.downcase == 'y'
+          # Update frontmatter in the source file
+          info = classifiers[condition]
+          if info && info['file']
+            content = File.read(info['file'])
+            content.sub!("classifier: \"#{condition}\"", "classifier: \"#{new_condition}\"")
+            File.write(info['file'], content)
+            puts "  Updated #{info['file']}"
+          end
+        end
+      else
+        puts "  Rewrite failed or produced same condition."
+      end
+    end
+  end
+
+  print_summary
+end
+
+def print_summary
+  printf "\n\033[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
+  printf "\033[1m%d passed\033[0m", $pass
+  printf ", \033[31m%d failed\033[0m", $fail if $fail > 0
+  printf ", \033[33m%d skipped\033[0m", $skip if $skip > 0
+  puts
+  exit($fail > 0 ? 1 : 0)
+end
+
+run
