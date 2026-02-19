@@ -7,12 +7,15 @@
 #     "file_path": "...", "command": "...", "prompt": "...", "content": "..." }
 #
 # Prints "yes" or "no" to stdout. Exits 0 on success, 1 on failure.
+# With --score flag, prints the numeric confidence score (0.0-1.0) instead.
 #
 # Dependencies: ruby stdlib, ollama
 
 require_relative '../lib/classifier'
 require 'json'
 require 'open3'
+
+score_mode = ARGV.delete('--score')
 
 SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', __dir__)
 if File.directory?(SPILL_HOME)
@@ -31,11 +34,35 @@ if fields.empty?
 end
 
 prompt = CLASSIFIER_TEMPLATE % { condition: condition, fields: fields }
-stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt, err: File::NULL)
 
-unless status.success?
-  defined?(Spill) ? Spill.error("ollama exited with #{status.exitstatus}") : $stderr.puts("classify: ollama exited with #{status.exitstatus}")
-  exit 1
+# Try logprob-based classification first
+result = classify_with_logprobs(prompt, model)
+
+if result
+  if score_mode
+    puts format('%.3f', result[:score])
+  else
+    puts result[:answer]
+  end
+else
+  # Fallback: shell out to ollama run (no score available)
+  if score_mode
+    msg = "logprob classification failed; --score unavailable in fallback mode"
+    defined?(Spill) ? Spill.warn(msg) : $stderr.puts("classify: #{msg}")
+  end
+
+  stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt, err: File::NULL)
+
+  unless status.success?
+    defined?(Spill) ? Spill.error("ollama exited with #{status.exitstatus}") : $stderr.puts("classify: ollama exited with #{status.exitstatus}")
+    exit 1
+  end
+
+  answer = stdout.strip.downcase.start_with?('yes') ? 'yes' : 'no'
+  if score_mode
+    # Best-effort: emit 1.0 or 0.0 based on text answer
+    puts answer == 'yes' ? '1.000' : '0.000'
+  else
+    puts answer
+  end
 end
-
-puts stdout.strip.downcase.start_with?('yes') ? 'yes' : 'no'
