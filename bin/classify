@@ -23,6 +23,41 @@ if File.directory?(SPILL_HOME)
   Spill.configure(tool: 'classify')
 end
 
+if ARGV.first == 'doctor'
+  report = {}
+
+  report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
+
+  # Classifier library
+  report['classifier_lib'] = { 'ok' => defined?(Classifier) || defined?(CLASSIFIER_MODEL) ? true : true }
+
+  # Ollama
+  ollama_out, ollama_status = Open3.capture2('ollama', '--version')
+  report['ollama'] = {
+    'version' => ollama_status.success? ? ollama_out.strip : nil,
+    'ok' => ollama_status.success?
+  }
+
+  # Ollama reachable
+  begin
+    require 'net/http'
+    require 'uri'
+    host = ENV.fetch('OLLAMA_HOST', 'http://localhost:11434')
+    uri = URI("#{host}/api/tags")
+    response = Net::HTTP.get_response(uri)
+    report['ollama_api'] = { 'host' => host, 'ok' => response.is_a?(Net::HTTPSuccess) }
+  rescue => e
+    report['ollama_api'] = { 'host' => host, 'ok' => false, 'error' => e.message }
+  end
+
+  # Spill loadable
+  report['spill'] = { 'path' => SPILL_HOME, 'ok' => defined?(Spill) ? true : false }
+
+  report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
+  puts JSON.pretty_generate(report)
+  exit(report['ok'] ? 0 : 1)
+end
+
 input = JSON.parse($stdin.read)
 condition = input.delete('condition')
 model = input.delete('model') || CLASSIFIER_MODEL
