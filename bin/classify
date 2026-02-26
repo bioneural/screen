@@ -53,6 +53,25 @@ if ARGV.first == 'doctor'
   # Spill loadable
   report['spill'] = { 'path' => SPILL_HOME, 'ok' => defined?(Spill) ? true : false }
 
+  # Probe
+  if ARGV.include?('--probe')
+    if report.dig('ollama_api', 'ok')
+      begin
+        input = JSON.generate({ 'condition' => 'Is 2+2 equal to 4?', 'content' => '2+2 = 4' })
+        output, status = Open3.capture2('ruby', __FILE__, stdin_data: input, err: File::NULL)
+        answer = output.strip.downcase
+        valid = %w[yes no].include?(answer)
+        report['probe'] = { 'ok' => true, 'answer' => answer }
+        report['probe']['warn'] = "expected yes or no, got: #{answer}" unless valid
+      rescue => e
+        report['probe'] = { 'ok' => true, 'warn' => "probe error: #{e.message}" }
+      end
+    else
+      report['probe'] = { 'ok' => true, 'skipped' => 'ollama unavailable' }
+    end
+  end
+
+  report['protocol_version'] = 1
   report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
   puts JSON.pretty_generate(report)
   exit(report['ok'] ? 0 : 1)
