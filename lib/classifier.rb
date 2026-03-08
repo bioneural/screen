@@ -15,7 +15,7 @@ CLASSIFIER_TEMPLATE = "Does the following condition apply to this input? " \
                       "<condition>%{condition}</condition>\n\n" \
                       "<input>\n%{fields}\n</input>"
 
-CLASSIFIER_MODEL = 'gemma3:1b'
+CLASSIFIER_MODEL = 'gemma3:4b'
 
 OLLAMA_HOST = ENV['OLLAMA_HOST'] || 'http://localhost:11434'
 
