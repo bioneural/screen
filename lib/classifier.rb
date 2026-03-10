@@ -15,9 +15,10 @@ CLASSIFIER_TEMPLATE = "Does the following condition apply to this input? " \
                       "<condition>%{condition}</condition>\n\n" \
                       "<input>\n%{fields}\n</input>"
 
-CLASSIFIER_MODEL = 'gemma3:4b'
+CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'
 
-OLLAMA_HOST = ENV['OLLAMA_HOST'] || 'http://localhost:11434'
+ANTHROPIC_API_KEY = ENV['ANTHROPIC_API_KEY']
+ANTHROPIC_API_BASE = ENV.fetch('ANTHROPIC_API_BASE', 'https://api.anthropic.com')
 
 # Build XML-structured input from flat field hash.
 # Every field gets its own XML tag — no colon-delimited boundaries.
@@ -39,53 +40,39 @@ def build_classifier_input(fields)
   parts.join("\n")
 end
 
-# Classify via ollama /api/chat with logprobs for a continuous confidence score.
-# Returns { answer: 'yes'/'no', score: 0.0-1.0 } on success, nil on failure.
-def classify_with_logprobs(prompt, model)
-  uri = URI("#{OLLAMA_HOST}/api/chat")
-  req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
+# Classify via Anthropic Messages API — binary yes/no.
+# Returns { answer: 'yes'/'no', score: 1.0/0.0 } on success, nil on failure.
+def classify_with_anthropic(prompt, model)
+  raise "ANTHROPIC_API_KEY is required" unless ANTHROPIC_API_KEY
+
+  uri = URI("#{ANTHROPIC_API_BASE}/v1/messages")
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type'] = 'application/json'
+  req['x-api-key'] = ANTHROPIC_API_KEY
+  req['anthropic-version'] = '2023-06-01'
 
   req.body = JSON.generate({
     model: model,
-    messages: [{ role: 'user', content: prompt }],
-    stream: false,
-    logprobs: true,
-    top_logprobs: 10,
-    options: { temperature: 0.0, num_predict: 1 }
+    max_tokens: 1,
+    temperature: 0,
+    messages: [{ role: 'user', content: prompt }]
   })
 
-  response = Net::HTTP.start(uri.hostname, uri.port) do |http|
-    http.read_timeout = 30
-    http.request(req)
-  end
+  http = Net::HTTP.new(uri.hostname, uri.port)
+  http.use_ssl = uri.scheme == 'https'
+  http.read_timeout = 30
+  response = http.request(req)
 
   return nil unless response.is_a?(Net::HTTPSuccess)
 
   data = JSON.parse(response.body)
-  top = data.dig('logprobs', 0, 'top_logprobs')
-  return nil unless top
+  text = data.dig('content', 0, 'text').to_s.strip.downcase
+  answer = text.start_with?('yes') ? 'yes' : 'no'
+  score = answer == 'yes' ? 1.0 : 0.0
 
-  yes_lp = nil
-  no_lp = nil
-  top.each do |t|
-    token = t['token'].strip.downcase
-    yes_lp = t['logprob'] if token == 'yes' && yes_lp.nil?
-    no_lp = t['logprob'] if token == 'no' && no_lp.nil?
-  end
-
-  score = if yes_lp && no_lp
-    yes_p = Math.exp(yes_lp)
-    no_p = Math.exp(no_lp)
-    yes_p / (yes_p + no_p)
-  elsif yes_lp
-    1.0
-  else
-    0.0
-  end
-
-  { answer: score > 0.5 ? 'yes' : 'no', score: score }
-rescue Errno::ECONNREFUSED
-  nil
+  { answer: answer, score: score }
+rescue RuntimeError
+  raise
 rescue => e
   nil
 end

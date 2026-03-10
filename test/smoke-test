@@ -1,0 +1,136 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# test/smoke-test — verify screen repo structure, syntax, and classify mock
+#
+# Usage:
+#   test/smoke-test           # fast: mock Anthropic
+#   test/smoke-test --full    # includes generative classifier tests (real API)
+#
+# Dependencies: ruby, ANTHROPIC_API_KEY (only with --full)
+#
+# Behavior:
+#   1. Checks structure (bin/classify, lib/classifier.rb exist)
+#   2. Syntax-checks Ruby files
+#   3. Tests classify with mock Anthropic HTTP server
+#   4. Runs generative-classifiers if --full
+#   5. Reports pass/fail, exits 0/1
+
+require_relative '../../prophet/test/lib/test_harness'
+include TestHarness
+
+require 'json'
+require 'open3'
+
+SCREEN_ROOT = File.expand_path('..', __dir__)
+
+section 'Structure'
+
+%w[bin/classify lib/classifier.rb test/generative-classifiers].each do |f|
+  path = File.join(SCREEN_ROOT, f)
+  if File.exist?(path)
+    pass "#{f} exists"
+  else
+    fail f, 'not found'
+  end
+end
+
+%w[bin/classify test/generative-classifiers].each do |f|
+  path = File.join(SCREEN_ROOT, f)
+  if File.executable?(path)
+    pass "#{f} is executable"
+  else
+    fail f, 'not executable'
+  end
+end
+
+section 'Syntax'
+
+%w[bin/classify lib/classifier.rb].each do |f|
+  path = File.join(SCREEN_ROOT, f)
+  _, status = Open3.capture2('ruby', '-c', path, err: File::NULL)
+  if status.success?
+    pass "#{f} passes syntax check"
+  else
+    fail "#{f} syntax", 'syntax error'
+  end
+end
+
+section 'Classify with mock'
+
+# Use ANTHROPIC_API_BASE if set (prophet runner provides mock), otherwise skip
+anthropic_base = ENV['ANTHROPIC_API_BASE']
+anthropic_key = ENV['ANTHROPIC_API_KEY']
+if anthropic_base && anthropic_key
+  classify = File.join(SCREEN_ROOT, 'bin', 'classify')
+  input = JSON.generate({
+    condition: 'The input discusses testing.',
+    prompt: 'We need to add smoke tests.'
+  })
+
+  env = { 'ANTHROPIC_API_BASE' => anthropic_base, 'ANTHROPIC_API_KEY' => anthropic_key }
+  stdout, stderr, status = Open3.capture3(env, classify, stdin_data: input)
+  answer = stdout.strip
+
+  if status.success? && %w[yes no].include?(answer)
+    pass "classify returns '#{answer}' with mock Anthropic"
+  else
+    fail 'classify with mock', "exit=#{status.exitstatus}, answer=#{answer}"
+  end
+
+  # --score mode
+  stdout2, _, status2 = Open3.capture3(env, classify, '--score', stdin_data: input)
+  score = stdout2.strip
+  if status2.success? && score.match?(/\A\d+\.\d+\z/)
+    pass "classify --score returns numeric score (#{score})"
+  else
+    fail 'classify --score', "exit=#{status2.exitstatus}, output=#{score}"
+  end
+else
+  skip 'classify with mock', 'ANTHROPIC_API_BASE not set'
+  skip 'classify --score', 'ANTHROPIC_API_BASE not set'
+end
+
+section 'Doctor'
+
+doctor_env = {}
+doctor_env['ANTHROPIC_API_BASE'] = anthropic_base if anthropic_base
+doctor_env['ANTHROPIC_API_KEY'] = anthropic_key if anthropic_key
+doctor_out, doctor_status = Open3.capture2(
+  doctor_env,
+  File.join(SCREEN_ROOT, 'bin', 'classify'), 'doctor'
+)
+begin
+  report = JSON.parse(doctor_out)
+  if doctor_status.success?
+    pass 'classify doctor exits 0 with valid JSON'
+  else
+    pass 'classify doctor returns valid JSON (some prerequisites missing in mock mode)'
+  end
+rescue
+  fail 'classify doctor', "not valid JSON (exit #{doctor_status.exitstatus}): #{doctor_out}"
+end
+
+if full?
+  section 'Generative classifiers (--full)'
+
+  gc_script = File.join(SCREEN_ROOT, 'test', 'generative-classifiers')
+  # Generative classifiers need search dirs for context discovery
+  prophet_root = File.expand_path('../../prophet', SCREEN_ROOT)
+  deps_file = File.join(prophet_root, 'lib', 'dependencies.rb')
+
+  search_dirs = [prophet_root]
+  if File.exist?(deps_file)
+    load deps_file
+    DEPENDENCIES.each_value { |d| search_dirs << d if File.directory?(File.join(d, 'context')) }
+  end
+
+  stdout, status = Open3.capture2(gc_script, *search_dirs)
+  if status.success?
+    pass 'Generative classifier tests pass'
+  else
+    fail 'Generative classifier tests', "exit #{status.exitstatus}"
+  end
+end
+
+finish!
